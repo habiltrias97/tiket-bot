@@ -1,0 +1,12 @@
+services:
+  tiket-bot:
+    build: .
+    container_name: tiket-bot
+    restart: unless-stopped
+    environment:
+      - BOT_MODE=monitor
+      - HEADLESS=true
+    volumes:
+      - ./reports:/app/reports
+      - ./config.py:/app/config.py
+    shm_size: '2gb'

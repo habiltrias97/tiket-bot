@@ -1,0 +1,13 @@
+# Dependencies untuk Bot Monitoring Tiket.com
+
+# Web Scraping
+selenium>=4.15.0
+webdriver-manager>=4.0.1
+requests>=2.31.0
+
+# Notifikasi
+# win10toast>=0.9  # Windows only, opsional
+plyer>=2.1.0
+
+# Utilities
+python-dotenv>=1.0.0
