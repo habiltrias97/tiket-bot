@@ -14,6 +14,7 @@ import shutil
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlencode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from selenium import webdriver
@@ -113,35 +114,45 @@ class TiketFlightMonitor:
         return f"{self.BASE_URL}?{urlencode(params)}"
     
     def search_flights_selenium(self, origin: str, destination: str, date: str,
-                                adult: int = 1, child: int = 0, infant: int = 0) -> List[Dict[str, Any]]:
+                                adult: int = 1, child: int = 0, infant: int = 0,
+                                driver: Optional[webdriver.Chrome] = None) -> List[Dict[str, Any]]:
         """Cari penerbangan menggunakan Selenium."""
         
         flights = []
         
         try:
-            if self.driver is None:
-                self.driver = self._init_driver()
+            if driver is not None:
+                use_driver = driver
+            else:
+                if self.driver is None:
+                    self.driver = self._init_driver()
+                use_driver = self.driver
             
             url = self.build_search_url(origin, destination, date, adult, child, infant)
             print(f"\n🔍 Mencari penerbangan: {origin} → {destination} pada {date}")
             print(f"   URL: {url}")
             
-            self.driver.get(url)
+            use_driver.get(url)
             
             # Tunggu halaman loading
-            time.sleep(5)
+            time.sleep(3)
             
-            # Tunggu hasil pencarian muncul
+            # Tunggu hasil pencarian atau indikator halaman selesai dimuat
             try:
-                WebDriverWait(self.driver, 30).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='flight-result-item'], .flight-item, .css-1dbjc4n"))
+                WebDriverWait(use_driver, 30).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR,
+                        "[data-testid='flight-result-item'], .flight-item, .css-1dbjc4n, "
+                        "div[class*='result'], div[class*='empty'], div[class*='notfound'], "
+                        "div[class*='no-result'], [data-testid*='empty'], [data-testid*='not-found'], "
+                        "[class*='EmptyState'], [class*='empty-state'], [class*='NoResult']"
+                    ))
                 )
             except TimeoutException:
                 print("   ⏱️ Timeout menunggu hasil pencarian")
             
             # Scroll untuk memuat lebih banyak hasil
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-            time.sleep(2)
+            use_driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+            time.sleep(1)
             
             # Coba berbagai selector untuk menemukan flight cards (direct flight only)
             selectors = [
@@ -156,7 +167,7 @@ class TiketFlightMonitor:
             flight_elements = []
             for selector in selectors:
                 try:
-                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    elements = use_driver.find_elements(By.CSS_SELECTOR, selector)
                     if elements:
                         flight_elements = elements
                         print(f"   ✅ Ditemukan {len(elements)} elemen dengan selector: {selector}")
@@ -176,7 +187,7 @@ class TiketFlightMonitor:
             
             # Jika tidak menemukan dengan selector, coba parse dari page source
             if not flights:
-                flights = self._parse_from_page_source()
+                flights = self._parse_from_page_source(use_driver)
                 # Filter hanya flight dengan data valid dan ambil 1
                 flights = [f for f in flights if self._is_valid_flight(f)][:1]
             
@@ -311,12 +322,13 @@ class TiketFlightMonitor:
             self._has_valid_airline(flight_info)
         )
     
-    def _parse_from_page_source(self) -> List[Dict[str, Any]]:
+    def _parse_from_page_source(self, driver=None) -> List[Dict[str, Any]]:
         """Parse penerbangan dari page source (untuk React/Next.js apps)."""
         flights = []
+        use_driver = driver if driver is not None else self.driver
         
         try:
-            page_source = self.driver.page_source
+            page_source = use_driver.page_source
             
             # Cari JSON data dalam script tags
             script_pattern = r'<script[^>]*>.*?(__NEXT_DATA__|window\.__INITIAL_STATE__).*?</script>'
@@ -358,6 +370,51 @@ class TiketFlightMonitor:
         
         return self.search_flights_selenium(origin, destination, date, adult, child, infant)
     
+    def _check_date_standalone(self, date: str) -> tuple:
+        """Cek penerbangan untuk satu tanggal dengan driver terpisah (untuk parallel execution)."""
+        driver = None
+        try:
+            driver = self._init_driver()
+            origin = FLIGHT_CONFIG.get("origin", "CGK")
+            destination = FLIGHT_CONFIG.get("destination", "DPS")
+            adult = FLIGHT_CONFIG.get("adult", 1)
+            child = FLIGHT_CONFIG.get("child", 0)
+            infant = FLIGHT_CONFIG.get("infant", 0)
+            
+            flights = self.search_flights_selenium(origin, destination, date, adult, child, infant, driver=driver)
+            return (date, flights)
+        except Exception as e:
+            print(f"   ❌ Error untuk {date}: {str(e)}")
+            return (date, [])
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def check_all_dates_parallel(self, dates: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Cek semua tanggal secara parallel menggunakan multiple browser."""
+        results = {}
+        max_workers = min(len(dates), 4)
+        
+        print(f"\n🚀 Memulai pencarian parallel untuk {len(dates)} tanggal (max {max_workers} browser)...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._check_date_standalone, date): date for date in dates}
+            
+            for future in as_completed(futures):
+                date = futures[future]
+                try:
+                    _, flights = future.result()
+                    results[date] = flights
+                except Exception as e:
+                    print(f"   ❌ Error untuk {date}: {str(e)}")
+                    results[date] = []
+        
+        print(f"\n✅ Pencarian parallel selesai untuk {len(dates)} tanggal")
+        return results
+    
     def monitor_flights(self) -> None:
         """Mulai monitoring penerbangan."""
         
@@ -375,24 +432,30 @@ class TiketFlightMonitor:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"\n⏰ [{current_time}] Memulai pengecekan...")
                 
-                for date in FLIGHT_CONFIG["dates"]:
-                    route = f"{FLIGHT_CONFIG['origin']} → {FLIGHT_CONFIG['destination']}"
-                    
-                    try:
-                        flights = self.check_flights_for_date(date)
-                        
+                dates = FLIGHT_CONFIG["dates"]
+                route = f"{FLIGHT_CONFIG['origin']} → {FLIGHT_CONFIG['destination']}"
+                
+                if len(dates) > 1:
+                    # Pencarian parallel untuk multi tanggal
+                    results = self.check_all_dates_parallel(dates)
+                    for date in dates:
+                        flights = results.get(date, [])
                         if flights:
-                            # Selalu kirim notifikasi dan buat report
                             self.notifier.notify_flight_found(flights, date, route)
                         else:
                             self.notifier.notify_no_flight(date, route)
-                        
-                        # Delay antara pencarian
-                        time.sleep(3)
-                        
-                    except Exception as e:
-                        print(f"   ❌ Error untuk {date}: {str(e)}")
-                        continue
+                else:
+                    # Pencarian sequential untuk satu tanggal
+                    for date in dates:
+                        try:
+                            flights = self.check_flights_for_date(date)
+                            if flights:
+                                self.notifier.notify_flight_found(flights, date, route)
+                            else:
+                                self.notifier.notify_no_flight(date, route)
+                        except Exception as e:
+                            print(f"   ❌ Error untuk {date}: {str(e)}")
+                            continue
                 
                 print(f"\n💤 Menunggu {CHECK_INTERVAL} detik sebelum pengecekan berikutnya...")
                 print("-"*60)
@@ -419,17 +482,25 @@ class TiketFlightMonitor:
         print("🔍 PENGECEKAN SEKALI - BOT TIKET.COM")
         print("="*60)
         
-        for date in FLIGHT_CONFIG["dates"]:
-            route = f"{FLIGHT_CONFIG['origin']} → {FLIGHT_CONFIG['destination']}"
-            
-            flights = self.check_flights_for_date(date)
-            
-            if flights:
-                self.notifier.notify_flight_found(flights, date, route)
-            else:
-                self.notifier.notify_no_flight(date, route)
-            
-            time.sleep(2)
+        dates = FLIGHT_CONFIG["dates"]
+        route = f"{FLIGHT_CONFIG['origin']} → {FLIGHT_CONFIG['destination']}"
+        
+        if len(dates) > 1:
+            # Pencarian parallel untuk multi tanggal
+            results = self.check_all_dates_parallel(dates)
+            for date in dates:
+                flights = results.get(date, [])
+                if flights:
+                    self.notifier.notify_flight_found(flights, date, route)
+                else:
+                    self.notifier.notify_no_flight(date, route)
+        else:
+            for date in dates:
+                flights = self.check_flights_for_date(date)
+                if flights:
+                    self.notifier.notify_flight_found(flights, date, route)
+                else:
+                    self.notifier.notify_no_flight(date, route)
         
         self.cleanup()
         print("\n✅ Pengecekan selesai!")
